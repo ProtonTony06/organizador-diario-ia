@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plan del día</title>
+<meta name="theme-color" content="#191816">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon.svg">
+<style>
+  :root {
+    --fondo: #f4f2ec; --tinta: #2b2a26; --suave: #6f6a5e;
+    --linea: #ded9cd; --acento: #2563eb; --tarjeta: #ffffff;
+    --hecha: #16a34a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fondo: #191816; --tinta: #e8e4da; --suave: #9a9488;
+      --linea: #33302a; --tarjeta: #21201c; --acento: #7aa2ff; --hecha: #4ade80;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 20px 16px 48px; background: var(--fondo);
+         color: var(--tinta); font: 16px/1.5 system-ui, sans-serif; }
+  main { max-width: 640px; margin: 0 auto; }
+  h1 { font-size: 1.3rem; margin: 0 0 4px; }
+  .meta { color: var(--suave); font-size: .9rem; margin-bottom: 16px; }
+  .grupo { margin: 18px 0 8px; font-size: .85rem; letter-spacing: .06em;
+           text-transform: uppercase; color: var(--suave); }
+  .bloque { display: flex; align-items: center; gap: 12px; padding: 10px 14px;
+            margin-bottom: 8px; border-radius: 10px; background: var(--tarjeta);
+            border: 1px solid var(--linea); }
+  .bloque.ancla { opacity: .55; }
+  .bloque.descanso { opacity: .6; font-size: .95rem; padding-top: 7px; padding-bottom: 7px; }
+  .bloque.cerrada { opacity: .5; border-color: var(--hecha); }
+  .bloque.cerrada .texto { text-decoration: line-through; }
+  .hora { font-variant-numeric: tabular-nums; font-weight: 600; min-width: 11ch; }
+  .texto { flex: 1; }
+  .categoria { font-size: .78rem; color: var(--suave); }
+  .muted { color: var(--suave); font-weight: 400; }
+  button { border: 1px solid var(--linea); background:var(--tarjeta); color: var(--tinta);
+           border-radius: 8px; padding: 6px 12px; cursor: pointer; font: inherit; }
+  button.cerrar:hover { border-color: var(--hecha); color: var(--hecha); }
+  button[disabled] { opacity: .4; cursor: default; }
+  .estado { margin: 12px 0; padding: 10px 14px; border-radius: 10px;
+            border: 1px solid var(--linea); background: var(--tarjeta); display: none; }
+  .estado.visible { display: block; }
+  .estado.error { border-color: #dc2626; color: #dc2626; }
+  blockquote { margin: 18px 0 0; padding: 10px 14px; border-left: 3px solid var(--acento);
+               background: var(--tarjeta); border-radius: 0 10px 10px 0; color: var(--suave); }
+  .vacio { color: var(--suave); }
+  button:focus-visible { outline: 2px solid var(--acento); outline-offset: 2px; }
+  footer { margin-top: 28px; padding-top: 10px; border-top: 1px solid var(--linea);
+           color: var(--suave); font-size: .78rem; line-height: 1.5; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Plan del día</h1>
+  <div class="meta" id="meta">cargando…</div>
+  <div class="estado" id="estado"></div>
+  <div id="contenido" class="vacio">cargando…</div>
+  <footer>
+    Cómo instalar la app:
+    <strong>Android</strong>: menú del navegador → «Añadir a pantalla de inicio».
+    <strong>iOS</strong>: botón Compartir → «Añadir a pantalla de inicio».
+  </footer>
+</main>
+<script>
+let temporizador = null;
+let replanPrevio = null;
+const CATEGORIAS = {foco: "Foco", personal: "Personal", descanso: "Descanso", ancla: "Fija"};
+
+function escapar(texto) {
+  return String(texto).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+function pintar(plan) {
+  const contenido = document.getElementById("contenido");
+  const meta = document.getElementById("meta");
+  if (!plan.hay_plan) {
+    meta.textContent = plan.fecha;
+    contenido.textContent = plan.mensaje || "Sin plan para hoy.";
+    return;
+  }
+  meta.textContent = `generado a las ${plan.generado || "?"} · refresco automático cada 20 s`;
+  const porGrupo = new Map();
+  for (const b of plan.bloques) {
+    const clave = b.inicio < "12:00" ? "Mañana" : (b.inicio >= "12:00" && b.inicio < "19:00" ? "Tarde" : "Noche");
+    if (!porGrupo.has(clave)) porGrupo.set(clave, []);
+    porGrupo.get(clave).push(b);
+  }
+  let html = "";
+  for (const [clave, bloques] of porGrupo) {
+    html += `<div class="grupo">${clave}</div>`;
+    for (const b of bloques) {
+      const clase = ["bloque", b.tipo, b.cerrada ? "cerrada" : ""].filter(Boolean).join(" ");
+      const cat = b.planificada ? `<span class="categoria">${CATEGORIAS[b.tipo] || b.tipo}</span> ` : "";
+      const texto = b.cerrada ? `${b.texto_tarea || b.titulo} ✓` : (b.texto_tarea || b.titulo || "—");
+      const enReplan = plan.replan === "ejecutando";
+      const nombre = escapar(b.texto_tarea || b.titulo || b.tarea || "");
+      const boton = (b.planificada && !b.cerrada)
+        ? (enReplan
+          ? `<button class="cerrar" data-id="${b.tarea}" disabled title="Re-plan en marcha: espera a que termine" aria-label="Re-plan en marcha: aún no se puede cerrar ${nombre}">✓</button>`
+          : `<button class="cerrar" data-id="${b.tarea}" title="Marca la tarea como hecha" aria-label="Marcar como hecha: ${nombre}">✓</button>`)
+        : "";
+      html += `<div class="${clase}">
+        <span class="hora">${b.inicio}–${b.fin}</span>
+        <span class="texto">${cat}${texto}</span>
+        ${boton}
+      </div>`;
+    }
+  }
+  if (plan.no_caben && plan.no_caben.length) {
+    html += `<div class="grupo">Sin hueco hoy</div>`;
+    for (const t of plan.no_caben)
+      html += `<div class="bloque"><span class="texto">[${t.categoria}] ${t.texto}</span></div>`;
+  }
+  if (plan.pendientes_sin_bloque && plan.pendientes_sin_bloque.length) {
+    html += `<div class="grupo">Pendientes fuera del plan</div>`;
+    for (const t of plan.pendientes_sin_bloque)
+      html += `<div class="bloque ancla" title="Pendiente en el inbox: el plan no le dio hueco hoy">
+        <span class="hora muted">·</span>
+        <span class="texto">${t.texto} <span class="categoria">· ${t.categoria}</span></span>
+      </div>`;
+  }
+  if (plan.comentario) html += `<blockquote>${plan.comentario}</blockquote>`;
+  contenido.innerHTML = html;
+}
+
+async function cerrarTarea(evento) {
+  const boton = evento.target.closest("button.cerrar");
+  if (!boton || boton.disabled) return;
+  boton.disabled = true;
+  try {
+    const respuesta = await fetch(`/api/tarea/${boton.dataset.id}/cerrar`, {method: "POST"});
+    if (!respuesta.ok) throw new Error(await respuesta.text());
+    mostrarEstado("Tarea cerrada: re-planificando el resto del día…");
+  } catch (error) {
+    mostrarEstado("No se pudo cerrar la tarea: " + error.message, true);
+  }
+  refrescar();
+}
+
+function mostrarEstado(texto, esError = false) {
+  const caja = document.getElementById("estado");
+  caja.textContent = texto;
+  caja.className = "estado visible" + (esError ? " error" : "");
+}
+
+async function refrescar() {
+  try {
+    const plan = await (await fetch("/api/plan")).json();
+    pintar(plan);
+    const caja = document.getElementById("estado");
+    if (plan.replan === "ejecutando") {
+      replanPrevio = "ejecutando";
+      mostrarEstado("Re-planificando el resto del día (el modelo tarda 1–3 min)…");
+    } else if (plan.replan === "listo") {
+      const acababaDeReplan = replanPrevio === "ejecutando";
+      replanPrevio = null;
+      caja.className = "estado";
+      if (acababaDeReplan) setTimeout(refrescar, 1500); // refresco inmediato tras terminar el re-plan
+    } else if (plan.replan === "error") {
+      replanPrevio = null;
+      mostrarEstado("El re-plan falló: revisa el servidor.", true);
+    }
+  } catch {
+    document.getElementById("contenido").textContent = "Servidor no alcanzable.";
+  }
+}
+
+refrescar();
+document.getElementById("contenido").addEventListener("click", cerrarTarea);
+temporizador = setInterval(refrescar, 20000);
+</script>
+</body>
+</html>

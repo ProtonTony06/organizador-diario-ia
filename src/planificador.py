@@ -154,12 +154,21 @@ def leer_config() -> dict:
 
 
 def _minutos(hora: str) -> int | None:
-    """'07:30' → minutos desde las 00:00; horas < 6 cuentan como día siguiente."""
+    """'07:30' → minutos desde las 00:00; horas < 6 cuentan como día siguiente.
+
+    Rangos validados: minutos 0–59 y horas 0–23 (el cruce de medianoche va
+    por las horas < 6, no por 25:70 — un modelo puede emitir horas absurdas
+    y no deben pasar la validación).
+    """
     m = HORA.match(hora.strip())
     if not m:
         return None
-    valor = int(m.group(1)) * 60 + int(m.group(2))
-    if int(m.group(1)) < 6:
+    minuto = int(m.group(1))
+    segundo = int(m.group(2))
+    if minuto > 23 or segundo > 59:
+        return None
+    valor = minuto * 60 + segundo
+    if minuto < 6:
         valor += 24 * 60
     return valor
 
@@ -273,7 +282,13 @@ def _validar(respuesta: dict, tareas: list, rutinas: dict) -> list[str]:
     for inicio, fin, _bloque, _tid in orden:
         if fin_previo is not None and inicio < fin_previo:
             errores.append(f"bloques solapados alrededor de las {_hhmm(inicio)}")
-        fin_previo = fin
+            # I7 (2026-10-25): quedarse con el fin MÁS LARGO. Con la
+            # reasignación directa una tarea ANIDADA (que acaba antes que la
+            # que la contiene) encogía fin_previo y el bloque siguiente ya
+            # no se comparaba contra el solape real.
+            fin_previo = max(fin_previo, fin)
+        else:
+            fin_previo = fin
         if inicio < ventana_inicio or fin > ventana_fin:
             errores.append(f"bloque {_hhmm(inicio)}–{_hhmm(fin)} fuera de la ventana")
             continue
@@ -281,15 +296,52 @@ def _validar(respuesta: dict, tareas: list, rutinas: dict) -> list[str]:
             if inicio < a_fin and a_inicio < fin:
                 errores.append(f"bloque {_hhmm(inicio)}–{_hhmm(fin)} pisa la ancla {nombre}")
 
+    # Regla de COHERENCIA tipo/tarea (hallazgo del test end-to-end real,
+    # 2026-10-25: el modelo puso una tarea pendiente como bloque "personal"
+    # con SOLO el título y se colaba — la web la listaba duplicada):
+    # - un bloque "foco" DEBE enlazar un id de tarea del inbox;
+    # - un bloque "personal"/"descanso" NO lleva tarea.
+    for inicio, fin, bloque, tid in normalizados:
+        tipo = str(bloque.get("tipo") or "foco").strip().lower()
+        if tipo == "foco" and not tid:
+            errores.append(
+                f"bloque foco {_hhmm(inicio)}–{_hhmm(fin)} sin tarea: todo foco enlaza un id del inbox"
+            )
+        elif tipo in ("personal", "descanso") and tid:
+            errores.append(
+                f"bloque tipo {tipo} {_hhmm(inicio)}–{_hhmm(fin)} no puede llevar tarea "
+                f"(el id {tid!r} va en un bloque foco o en no_caben)"
+            )
+
+    # Toda tarea pendiente del inbox debe acabar PLANIFICADA (en un bloque,
+    # aunque esté duplicada: el duplicado se reporta aparte abajo) o
+    # marcada en "no_caben" — planificarla por título sin id NO vale.
+    no_caben_ids = {i for i in (respuesta.get("no_caben") or []) if isinstance(i, str)}
+    planificados = {tid for _, _, _, tid in normalizados if tid}
+    for tarea in tareas:
+        if tarea.id not in planificados and tarea.id not in no_caben_ids:
+            errores.append(f"la tarea {tarea.id} debe ir en un bloque foco o en \"no_caben\"")
+
     # Capacidad por categoría: minutos asignados a tareas de cada categoría.
     capacidades = rutinas.get("capacidades") or {}
     consumido: dict[str, int] = {}
     vistas: set[str] = set()
     for inicio, fin, _bloque, tid in normalizados:
-        if not tid or tid in vistas:
+        if not tid:
             continue
+        # I5 (2026-10-25): el id repetido se reporta en CADA aparición
+        # extra y NO se salta: siguen sumándose sus minutos, que es lo que
+        # la capacidad de la categoría tiene que reflejar.
+        if tid in vistas:
+            errores.append(f"tarea {tid} aparece en más de un bloque")
         vistas.add(tid)
-        tarea = por_id[tid]
+        # Un id desconocido YA se reportó al recorrer normalizados: aquí se
+        # ignora (get, no [ ]), que sea la lista de errores y no un KeyError
+        # el resultado de este bloque — un error de validación puede matar
+        # el pipeline entero si sale como excepción (bug 2026-10-25).
+        tarea = por_id.get(tid)
+        if tarea is None:
+            continue
         consumido[tarea.categoria] = consumido.get(tarea.categoria, 0) + (fin - inicio)
     for categoria, usado in consumido.items():
         limite = capacidades.get(categoria)
@@ -305,19 +357,25 @@ def _validar(respuesta: dict, tareas: list, rutinas: dict) -> list[str]:
     return errores
 
 
-def planificar(tareas: list, rutinas: dict, modelo: str, intentos: int = 2, fecha: str | None = None) -> dict:
-    """Reparte los bloques del día llamando a Ollama (JSON validado o error)."""
+def planificar(tareas: list, rutinas: dict, modelo: str, intentos: int = 2, fecha: str | None = None, desde: str | None = None) -> dict:
+    """Reparte los bloques del día llamando a Ollama (JSON validado o error).
+
+    `desde` (HH:MM) re-plancha el inicio de la ventana: es el re-plan del
+    resto del día (las tareas cerradas ya no están en el inbox).
+    """
+    if desde:
+        rutinas = dict(rutinas)
+        rutinas["ventana"] = {**(rutinas.get("ventana") or {}), "inicio": desde}
     if not tareas:
         log.info("Inbox vacío: no hace falta llamar al modelo")
         return {"plan": [], "no_caben": [], "comentario": "Inbox vacío: día de rutinas.", "valido": True}
     ventana = rutinas.get("ventana") or {}
     lista_anclas = "\n".join(
-        f'  - {a["nombre"]}: "tipo": "ancla", "tarea": null, "titulo": "{a["nombre"]}", '
-        f'"inicio": "{a["momento"]}"'
+        f'  - {a["nombre"]}: {a["momento"]}–{_hhmm(_minutos(str(a["momento"])) + int(a.get("duracion", 30)))} (OCUPADO, duración exacta {a.get("duracion", 30)} min)'
         for a in rutinas.get("anclas") or []
     )
     capacidades = " · ".join(f"{k}: {v} min/día" for k, v in (rutinas.get("capacidades") or {}).items())
-    prompt = PROMPT.format(
+    base = PROMPT.format(
         fecha=fecha or date.today().strftime("%Y-%m-%d"),
         lista_anclas=lista_anclas,
         ventana_inicio=str(ventana.get("inicio", "07:30")),
@@ -328,6 +386,15 @@ def planificar(tareas: list, rutinas: dict, modelo: str, intentos: int = 2, fech
     )
     errores, respuesta = [], None
     for intento in range(1, max(intentos, 1) + 1):
+        # El reintento SABE lo que pasó antes: errores del intento previo
+        # van pegados al prompt (reprobar sin pistas repite el mismo fallo).
+        prompt = base
+        if errores:
+            prompt = base + (
+                "\n\nCORRECCIÓN OBLIGATORIA: tu plan anterior NO sirve por esto: "
+                + "; ".join(errores)
+                + ". Regenera el JSON completo corrigiendo SOLO esos puntos."
+            )
         texto = llamar_ollama(prompt, modelo)
         respuesta = _elegir_respuesta(texto)
         if not isinstance(respuesta, dict) or not isinstance(respuesta.get("plan"), list):
@@ -347,6 +414,75 @@ def planificar(tareas: list, rutinas: dict, modelo: str, intentos: int = 2, fech
         raise RuntimeError("El plan viola las rutinas: " + "; ".join(errores))
     log.info("Plan válido: %d bloques", len(respuesta["plan"]))
     return respuesta
+
+
+def plan_mecanico(tareas: list, rutinas: dict, desde: str | None = None) -> dict:
+    """Plan de emergencia SIN modelo: colocación secuencial que respeta rutinas.
+
+    Si Ollama no da un plan válido tras los reintentos, la mañana no se
+    queda sin salida: se ordenan las pendientes (fecha límite primero,
+    luego categoría) y se colocan en los huecos entre anclas, con su
+    estimación (45m sin ella) y sin superar capacidades. Simple y verde;
+    el comentario lo declara como plan mecánico.
+    """
+    capacidades = rutinas.get("capacidades") or {}
+    ventana = rutinas.get("ventana") or {}
+    inicio = _minutos(desde or str(ventana.get("inicio", "07:30")))
+    fin_ventana = _minutos(str(ventana.get("fin", "01:00")))
+    if fin_ventana <= inicio:
+        fin_ventana += 24 * 60
+    anclas = _anclas_mingan(rutinas)
+
+    orden = sorted(
+        tareas,
+        key=lambda t: (t.antes or "9999-99-99", CATEGORIAS_ORDEN.get(t.categoria, 99), -(t.minutos or 45)),
+    )
+    bloques, no_caben = [], []
+    consumido: dict[str, int] = {}
+    cursor = inicio
+    for tarea in orden:
+        duracion = tarea.minutos or 45
+        limite = capacidades.get(tarea.categoria)
+        if limite is not None and consumido.get(tarea.categoria, 0) + duracion > int(limite):
+            no_caben.append(tarea.id)
+            continue
+        # Primer hueco desde cursor que aguante la tarea sin pisar un ancla.
+        puesto = False
+        for a_inicio, a_fin, _nombre in anclas:
+            inicio_hueco = cursor
+            fin_hueco = a_inicio if a_inicio >= cursor else None
+            if fin_hueco is not None and fin_hueco >= inicio_hueco + duracion:
+                bloques.append(_bloque(inicio_hueco, inicio_hueco + duracion, tarea))
+                consumido[tarea.categoria] = consumido.get(tarea.categoria, 0) + duracion
+                cursor = inicio_hueco + duracion
+                puesto = True
+                break
+            if a_inicio >= cursor:   # el hueco era corto: saltar tras la ancla
+                cursor = max(cursor, a_fin)
+        if not puesto:
+            if cursor + duracion <= fin_ventana:
+                bloques.append(_bloque(cursor, cursor + duracion, tarea))
+                consumido[tarea.categoria] = consumido.get(tarea.categoria, 0) + duracion
+                cursor += duracion
+            else:
+                no_caben.append(tarea.id)
+    return {
+        "plan": bloques,
+        "no_caben": no_caben,
+        "comentario": (
+            "Plan MECÁNICO (el modelo no dio un plan válido): colocación "
+            "secuencial respetando anclas y capacidades."
+        ),
+        "valido": True,
+        "fallback": True,
+    }
+
+
+CATEGORIAS_ORDEN = {"dev": 0, "formacion": 1, "hogar": 2, "personal": 3}
+
+
+def _bloque(inicio: int, fin: int, tarea) -> dict:
+    return {"inicio": _hhmm(inicio), "fin": _hhmm(fin), "tipo": "foco", "tarea": tarea.id}
 
 
 def main() -> int:

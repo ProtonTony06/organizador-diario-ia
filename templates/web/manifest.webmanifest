@@ -1,0 +1,13 @@
+{
+  "name": "Plan del día",
+  "short_name": "Plan",
+  "description": "Organizador diario: plan, cierre de tareas y ajustes del día",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#191816",
+  "theme_color": "#191816",
+  "lang": "es",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}

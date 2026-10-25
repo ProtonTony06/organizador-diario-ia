@@ -34,6 +34,21 @@ def _hhmm(minutos: int) -> str:
     return f"{minutos // 60:02d}:{minutos % 60:02d}"
 
 
+# Alias público: el plan.json (la vista de la web) lleva horas "HH:MM".
+hhmm = _hhmm
+
+
+def _id_tarea(valor) -> str:
+    """Normaliza el id de tarea igual que planificador._validar (I6).
+
+    'null' (así, como string que puede llegar del JSON del modelo) y None
+    son AUSENCIA de tarea: si pasaban al plan.json con la cadena "null", la
+    web buscaba una tarea con id "null" y la listaba como descolgada.
+    """
+    tid = "" if valor is None else str(valor).strip()
+    return "" if tid.lower() in ("", "null", "none") else tid
+
+
 def bloques_del_dia(resultado: dict, rutinas: dict) -> list[dict]:
     """Anclas fijas + bloques del modelo, unidos y ordenados por hora."""
     bloques = []
@@ -49,18 +64,25 @@ def bloques_del_dia(resultado: dict, rutinas: dict) -> list[dict]:
             "inicio": inicio, "fin": _minutos(str(bloque["fin"])),
             "tipo": str(bloque.get("tipo") or "foco"),
             "titulo": str(bloque.get("titulo") or ""),
-            "tarea": str(bloque.get("tarea") or ""),
+            "tarea": _id_tarea(bloque.get("tarea")),
             "nota": str(bloque.get("nota") or ""),
         })
     return sorted(bloques, key=lambda b: (b["inicio"], b["fin"]))
 
 
-def a_markdown(resultado: dict, tareas: list, fecha: str, rutinas: dict) -> str:
-    """Markdown del plan del día: timeline + tareas sin hueco + comentario."""
+def a_markdown(resultado: dict, tareas: list, fecha: str, rutinas: dict, generado: str | None = None) -> str:
+    """Markdown del plan del día: timeline + tareas sin hueco + comentario.
+
+    `generado` (HH:MM) se anota en la cabecera: distingue el plan de las
+    07:00 de un re-plan del resto del día.
+    """
     por_id = {t.id: t for t in tareas}
     dia = datetime.strptime(fecha, "%Y-%m-%d")
     dia_semana = DIAS_SEMANA[dia.weekday()].capitalize()
     partes = [f"# Plan del día — {dia_semana} {dia.strftime('%d/%m')}", ""]
+    if generado:
+        partes.append(f"*Re-planificado a las {generado}: el plan cubre solo lo que queda.*")
+        partes.append("")
 
     bloques = bloques_del_dia(resultado, rutinas)
     if bloques:

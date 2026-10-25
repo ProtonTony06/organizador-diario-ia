@@ -36,6 +36,12 @@ class TestParsearLinea(unittest.TestCase):
     def test_hecha_se_ignora(self):
         self.assertIsNone(parsear_linea("- [x] [dev] Hecha (est: 1h)"))
 
+    def test_checkbox_sin_texto_es_tarea_fantasma(self):
+        # M6 (2026-10-25): un checkbox cuyo texto SOLO era meta generaba una
+        # Tarea con texto vacío (id estable de la nada, "tarea fantasma")
+        self.assertIsNone(parsear_linea("- [ ] (est: 45m)"))
+        self.assertIsNone(parsear_linea("- [ ] [dev] (est: 45m, antes: 2026-10-31)"))
+
     def test_id_estable_por_texto(self):
         primera = parsear_linea("- [ ] [dev] A")
         # misma tarea tras líneas ajenas: el id solo depende de categoría+texto
