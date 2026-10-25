@@ -1,0 +1,368 @@
+"""Planifica el día: situación + inbox → Ollama → JSON validado del plan.
+
+El modelo SOLO sugiere la organización (bloques horarios); esta función es
+la única fuente de verdad del plan publicado: cada tarea referenciada debe
+existir en el inbox, los bloques no pueden pisar anclas ni salirse de la
+ventana, las horas de foco no pueden superar la capacidad configurada. Las
+ANCLAS el modelo no las pone: las añade el pipeline (bloques fijos), y la
+validación solo mira que sus bloques no las solapen. Lo inválido se
+descarta y se re-pregunta con el error como pista (INTENTOS veces).
+"""
+
+import argparse
+import hashlib
+import json
+import logging
+import re
+import subprocess
+import sys
+from datetime import date
+from pathlib import Path
+
+import yaml
+
+import entrada as mod_entrada
+
+RAIZ = Path(__file__).resolve().parent.parent
+CONFIG = RAIZ / "config" / "config.yaml"
+RUTINAS = RAIZ / "config" / "rutinas.yaml"
+
+ANSI = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|[\x00-\x08\x0b-\x1f]")
+HORA = re.compile(r"^(\d{1,2}):(\d{2})$")
+
+log = logging.getLogger("planificador")
+
+# Parámetros de llamada idénticos al resumen (lecciones 2026-10-24):
+# stdin DEVNULL (colgaba sin él) y --nowordwrap (el CLI corrompía
+# cadenas largas re-envolviendo las líneas).
+TIMEOUT_OLLAMA = 480.0
+
+
+def _limpiar(salida: str) -> str:
+    """Quita escapes ANSI y caracteres de control del stdout de ollama."""
+    return ANSI.sub("", salida)
+
+
+def _quitar_puntitos(segmento: str) -> str:
+    """Elimina los "..." literales FUERA de strings (imitación del prompt)."""
+    salida, i, n = [], 0, len(segmento)
+    en_string, escape = False, False
+    while i < n:
+        c = segmento[i]
+        if en_string:
+            salida.append(c)
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == '"':
+                en_string = False
+            i += 1
+        elif c == '"':
+            en_string = True
+            salida.append(c)
+            i += 1
+        elif segmento.startswith("...", i):
+            limpio = "".join(salida).rstrip()
+            if limpio.endswith(","):
+                limpio = limpio[:-1]
+            salida = list(limpio)
+            i += 3
+        else:
+            salida.append(c)
+            i += 1
+    return "".join(salida)
+
+
+def _parsear_objeto(texto: str, inicio: int, fin: int):
+    segmento = texto[inicio:fin]
+    try:
+        return json.loads(segmento)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    tolerado = _quitar_puntitos(segmento)
+    if tolerado == segmento:
+        return None
+    try:
+        return json.loads(tolerado)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def _extraer_jsons(texto: str) -> list:
+    """Todos los objetos JSON balanceados del texto (el modelo razona antes)."""
+    objetos = []
+    for inicio, caracter in enumerate(texto):
+        if caracter != "{":
+            continue
+        profundidad, en_string, escape = 0, False, False
+        for i in range(inicio, len(texto)):
+            c = texto[i]
+            if en_string:
+                if escape:
+                    escape = False
+                elif c == "\\":
+                    escape = True
+                elif c == '"':
+                    en_string = False
+            elif c == '"':
+                en_string = True
+            elif c == "{":
+                profundidad += 1
+            elif c == "}":
+                profundidad -= 1
+                if profundidad == 0:
+                    objeto = _parsear_objeto(texto, inicio, i + 1)
+                    if objeto is not None:
+                        objetos.append(objeto)
+                    break
+    return objetos
+
+
+def _elegir_respuesta(texto: str):
+    """El ÚLTIMO objeto con clave "plan" de tipo lista (los borradores van antes)."""
+    objetos = [o for o in _extraer_jsons(texto) if isinstance(o, dict)]
+    con_clave = [o for o in objetos if isinstance(o.get("plan"), list)]
+    return con_clave[-1] if con_clave else None
+
+
+def llamar_ollama(prompt: str, modelo: str, timeout: float = TIMEOUT_OLLAMA) -> str:
+    """Llama al CLI de ollama y devuelve stdout limpio (ver notas de resumen)."""
+    resultado = subprocess.run(
+        ["ollama", "run", modelo, "--think=false", "--format", "json", "--nowordwrap", prompt],
+        capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
+    )
+    if resultado.returncode != 0:
+        raise RuntimeError(
+            f"ollama devolvió código {resultado.returncode}: {resultado.stderr[-300:]}"
+        )
+    return _limpiar(resultado.stdout)
+
+
+def leer_config() -> dict:
+    """Lee config.yaml (modelo, intentos) y rutinas.yaml (ventana, anclas...)."""
+    with CONFIG.open(encoding="utf-8") as fichero:
+        config = yaml.safe_load(fichero) or {}
+    with RUTINAS.open(encoding="utf-8") as fichero:
+        rutinas = yaml.safe_load(fichero) or {}
+    config.setdefault("plan", {})
+    return {
+        "modelo": (config.get("ollama") or {}).get("modelo", "glm-5.3:cloud"),
+        "intentos": int(config["plan"].get("intentos", 2)),
+        "rutinas": rutinas,
+    }
+
+
+def _minutos(hora: str) -> int | None:
+    """'07:30' → minutos desde las 00:00; horas < 6 cuentan como día siguiente."""
+    m = HORA.match(hora.strip())
+    if not m:
+        return None
+    valor = int(m.group(1)) * 60 + int(m.group(2))
+    if int(m.group(1)) < 6:
+        valor += 24 * 60
+    return valor
+
+
+def _hhmm(minutos: int) -> str:
+    minutos %= 24 * 60
+    return f"{minutos // 60:02d}:{minutos % 60:02d}"
+
+
+def _anclas_mingan(rutinas: dict) -> list[tuple[int, int, str]]:
+    """Anclas → [(inicio_min, fin_min, nombre)] con la misma normalización."""
+    anclas = []
+    for ancla in rutinas.get("anclas") or []:
+        inicio = _minutos(str(ancla["momento"]))
+        if inicio is None:
+            continue
+        anclas.append((inicio, inicio + int(ancla.get("duracion", 30)), ancla["nombre"]))
+    return sorted(anclas)
+
+
+PROMPT = """Eres el organizador del día de Antonio Cuevas (Sevilla, España).
+Con tu lista de tareas pendientes y sus rutinas fijas, genera el plan para
+HOY (fecha: {fecha}).
+
+Responde EXCLUSIVAMENTE con un JSON (puedes envolverlo en vallas ```json)
+con esta forma exacta:
+{{
+  "plan": [
+    {{"inicio": "HH:MM", "fin": "HH:MM", "tipo": "foco|personal|descanso", "tarea": "<id|null>", "titulo": "<título corto>", "nota": "<opcional>"}}
+  ],
+  "no_caben": ["<id>", ...],
+  "comentario": "<una frase sobre el plan>"
+}}
+
+Reglas obligatorias:
+- Los bloques "foco" llevan UNA tarea del inbox (campo "tarea" con su id
+  exacto). Los "personal" y "descanso" llevan "tarea": null y un "titulo".
+- NO pongas las comidas ni snacks: el sistema las inserta solo. Tus bloques
+  no pueden pisar estas horas fijas:
+{lista_anclas}
+- Los bloques no se solapan ENTRE SÍ; van dentro de la ventana
+  {ventana_inicio}–{ventana_fin} (después de la medianoche sigue contando:
+  un bloque de las 00:30 es del mismo día).
+- Total del día por categoría respetando capacidades: {capacidades}.
+- Estimaciones: cada bloque "foco" dura ~la estimación de su tarea; si una
+  tarea no cabe este día, márcala en "no_caben" y no la planifiques.
+- Prioriza las tareas con fecha límite ("antes:").
+- Deja huecos de descanso: no rellenes toda la ventana de bloques.
+- Ningún placeholder, NINGÚN "...", NINGÚN comentario fuera del JSON.
+- La clave "plan" es exactamente esa y su valor una lista JSON válida.
+
+Preferencias del usuario:
+{preferencias}
+
+Tareas pendientes del inbox (id [categoría] texto):
+{tareas}"""
+
+
+def _validar(respuesta: dict, tareas: list, rutinas: dict) -> list[str]:
+    """Devuelve la lista de problemas del JSON del modelo ([] = válido).
+
+    El modelo no pone las anclas (las añade el pipeline), así que la
+    comprobación es: ids reales, dentro de ventana, sin solaparse entre sí
+    ni con las ventas de ancla, y sin superar las capacidades de foco.
+    """
+    errores: list[str] = []
+    por_id = {t.id: t for t in tareas}
+    bloques = respuesta.get("plan") if isinstance(respuesta, dict) else None
+    if not isinstance(bloques, list) or not bloques:
+        return ["\"plan\" no es una lista con bloques"]
+
+    def min_hora(bloque: dict, clave: str) -> int | None:
+        valor = bloque.get(clave) if isinstance(bloque, dict) else None
+        if not isinstance(valor, str):
+            return None
+        return _minutos(valor)
+
+    def id_tarea(bloque: dict) -> str:
+        """Id limpio del bloque (''/null/None → '')."""
+        tid = bloque.get("tarea")
+        tid = "" if tid is None else str(tid).strip()
+        return "" if tid.lower() in ("", "null", "none") else tid
+
+    normalizados = []
+    for bloque in bloques:
+        if not isinstance(bloque, dict):
+            errores.append(f"elemento de \"plan\" no es un objeto: {str(bloque)[:60]}")
+            continue
+        inicio, fin = min_hora(bloque, "inicio"), min_hora(bloque, "fin")
+        if inicio is None or fin is None:
+            errores.append(f"bloque con hora ilegible: {json.dumps(bloque, ensure_ascii=False)[:80]}")
+            continue
+        if fin <= inicio:
+            errores.append(f"bloque {_hhmm(inicio)}–{_hhmm(fin)} acaba antes de empezar")
+            continue
+        tid = id_tarea(bloque)
+        if tid and tid not in por_id:
+            errores.append(f"id de tarea desconocido en el inbox: {tid!r}")
+        normalizados.append((inicio, fin, bloque, tid))
+
+    ventana_inicio = _minutos(str((rutinas.get("ventana") or {}).get("inicio", "07:30")))
+    ventana_fin = _minutos(str((rutinas.get("ventana") or {}).get("fin", "01:00")))
+    if ventana_fin <= ventana_inicio:
+        ventana_fin += 24 * 60
+    anclas = _anclas_mingan(rutinas)
+
+    # Orden cronológico: solapamientos entre los bloques del modelo y contra
+    # las anclas (que el modelo no emite, pero no puede pisar).
+    orden = sorted(normalizados, key=lambda b: (b[0], b[1]))
+    fin_previo: int | None = None
+    for inicio, fin, _bloque, _tid in orden:
+        if fin_previo is not None and inicio < fin_previo:
+            errores.append(f"bloques solapados alrededor de las {_hhmm(inicio)}")
+        fin_previo = fin
+        if inicio < ventana_inicio or fin > ventana_fin:
+            errores.append(f"bloque {_hhmm(inicio)}–{_hhmm(fin)} fuera de la ventana")
+            continue
+        for a_inicio, a_fin, nombre in anclas:
+            if inicio < a_fin and a_inicio < fin:
+                errores.append(f"bloque {_hhmm(inicio)}–{_hhmm(fin)} pisa la ancla {nombre}")
+
+    # Capacidad por categoría: minutos asignados a tareas de cada categoría.
+    capacidades = rutinas.get("capacidades") or {}
+    consumido: dict[str, int] = {}
+    vistas: set[str] = set()
+    for inicio, fin, _bloque, tid in normalizados:
+        if not tid or tid in vistas:
+            continue
+        vistas.add(tid)
+        tarea = por_id[tid]
+        consumido[tarea.categoria] = consumido.get(tarea.categoria, 0) + (fin - inicio)
+    for categoria, usado in consumido.items():
+        limite = capacidades.get(categoria)
+        if limite is not None and usado > int(limite):
+            errores.append(
+                f"categoría {categoria}: {usado}m asignados superan la "
+                f"capacidad ({int(limite)}m)"
+            )
+
+    for tid in respuesta.get("no_caben") or []:
+        if isinstance(tid, str) and tid not in por_id:
+            errores.append(f"id desconocido en \"no_caben\": {tid!r}")
+    return errores
+
+
+def planificar(tareas: list, rutinas: dict, modelo: str, intentos: int = 2, fecha: str | None = None) -> dict:
+    """Reparte los bloques del día llamando a Ollama (JSON validado o error)."""
+    if not tareas:
+        log.info("Inbox vacío: no hace falta llamar al modelo")
+        return {"plan": [], "no_caben": [], "comentario": "Inbox vacío: día de rutinas.", "valido": True}
+    ventana = rutinas.get("ventana") or {}
+    lista_anclas = "\n".join(
+        f'  - {a["nombre"]}: "tipo": "ancla", "tarea": null, "titulo": "{a["nombre"]}", '
+        f'"inicio": "{a["momento"]}"'
+        for a in rutinas.get("anclas") or []
+    )
+    capacidades = " · ".join(f"{k}: {v} min/día" for k, v in (rutinas.get("capacidades") or {}).items())
+    prompt = PROMPT.format(
+        fecha=fecha or date.today().strftime("%Y-%m-%d"),
+        lista_anclas=lista_anclas,
+        ventana_inicio=str(ventana.get("inicio", "07:30")),
+        ventana_fin=str(ventana.get("fin", "01:00")),
+        capacidades=capacidades,
+        preferencias="\n".join(f"- {p}" for p in rutinas.get("preferencias") or []),
+        tareas=mod_entrada.a_prompt(tareas),
+    )
+    errores, respuesta = [], None
+    for intento in range(1, max(intentos, 1) + 1):
+        texto = llamar_ollama(prompt, modelo)
+        respuesta = _elegir_respuesta(texto)
+        if not isinstance(respuesta, dict) or not isinstance(respuesta.get("plan"), list):
+            respuesta = None
+            errores = ["la respuesta no lleva un JSON utilizable con la clave plan"]
+            log.warning("Intento %d sin JSON utilizable", intento)
+            continue
+        errores = _validar(respuesta, tareas, rutinas)
+        if not errores:
+            break
+        log.warning("Intento %d con %d problema(s) de validación: %s", intento, len(errores), "; ".join(errores))
+    if respuesta is None:
+        raise RuntimeError("Sin plan usable tras los reintentos")
+    respuesta["valido"] = not errores
+    if errores:
+        respuesta["errores"] = errores
+        raise RuntimeError("El plan viola las rutinas: " + "; ".join(errores))
+    log.info("Plan válido: %d bloques", len(respuesta["plan"]))
+    return respuesta
+
+
+def main() -> int:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    parser = argparse.ArgumentParser(description="Prueba del planificador con un inbox.")
+    parser.add_argument("--inbox", default=RAIZ / "data" / "inbox.md")
+    parser.add_argument("--fecha")
+    argumentos = parser.parse_args()
+    config = leer_config()
+    tareas = mod_entrada.leer(argumentos.inbox)
+    print(json.dumps(
+        planificar(tareas, config["rutinas"], config["modelo"], config["intentos"], argumentos.fecha),
+        ensure_ascii=False, indent=2,
+    ))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

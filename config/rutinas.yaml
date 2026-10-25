@@ -1,0 +1,25 @@
+# Rutinas del día de Antonio (entrevista 2026-10-25, sesión de arranque F0).
+# El planificador trata las anclas como bloques fijos que no puede pisar.
+
+ventana:
+  inicio: "07:30"   # se levanta
+  fin: "01:00"      # se duerme (el plan cruza la medianoche)
+
+anclas:
+  - { momento: "10:00", duracion: 30, nombre: "Desayuno" }
+  - { momento: "14:30", duracion: 90, nombre: "Comida" }    # empieza 14:30-15:00: margen
+  - { momento: "18:00", duracion: 20, nombre: "Merienda" }
+  - { momento: "22:00", duracion: 30, nombre: "Cena" }
+
+# Minutos máximos de foco por categoría en UN día: el plan no puede pasar.
+capacidades:
+  dev: 150        # 2-3 h (valor medio de la entrevista: conservador)
+  formacion: 120
+
+categorias: [dev, formacion, hogar, personal]
+
+preferencias:
+  - "El bloque temprano (hasta el desayuno de las 10:00) es de foco ligero: buen sitio para formación y puesta al día, no para lo más difícil."
+  - "Alterna categorías en vez de encadenar bloques largos de la misma."
+  - "Deja huecos de descanso; NO rellena toda la ventana de bloques."
+  - "Si algo tiene fecha límite (antes:...), prioriza lo que antes caduca."

@@ -1,0 +1,18 @@
+# Configuración del organizador diario (las rutinas van aparte, en rutinas.yaml).
+
+ollama:
+  # Modelo cloud (inferencia en los servidores de Ollama): el mismo verificado
+  # en resumen-diario-ia con sus mismas lecciones (--nowordwrap, stdin DEVNULL).
+  modelo: "glm-5.3:cloud"
+
+web_base: ""
+# Base absoluta para el Click de ntfy (la rellena el despliegue en la CT;
+# vacío = Click sin URL, la notificación sigue funcionando).
+
+notificaciones:
+  # Topic ntfy self-hosted en la CT (vacío = deshabilitado, like en el resumen).
+  ntfy_url: ""
+
+plan:
+  # Intentos ante una respuesta sin JSON utilizable (razonamiento del modelo).
+  intentos: 2
