@@ -2,7 +2,10 @@
 // abierta en el móvil (PWA) arranque aunque la red tailnet taseje; los datos
 // SIEMPRE van a la red (no se cachean: el plan vivo es lo único que importa).
 const SHELL = ["", "/manifest.webmanifest", "/icon.svg"];
-const CACHE = "plan-shell-v1";
+// v2 (2026-10-26): la web gana la pestaña Chat. La caché solo se llena en
+// install (network-first en fetch), así que subir la versión es lo que
+// fuerza al PWA ya instalado a re-descargar el shell con el HTML nuevo.
+const CACHE = "plan-shell-v2";
 
 self.addEventListener("install", (evento) => {
   evento.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(SHELL)));

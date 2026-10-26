@@ -5,3 +5,8 @@ out/
 # locks de ejecución (fcntl)
 data/inbox.lock
 data/pipeline.lock
+# datos personales de ejecución: NUNCA en un repo público
+# (inbox real, perfil aprendido del chat, candados)
+data/inbox.md
+data/perfil.md
+data/perfil.lock

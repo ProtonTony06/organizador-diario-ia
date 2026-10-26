@@ -119,11 +119,17 @@ def _extraer_jsons(texto: str) -> list:
     return objetos
 
 
+def _elegir_objeto(texto: str, criterio) -> dict | None:
+    """El ÚLTIMO objeto JSON balanceado que cumple el criterio (los
+    borradores del razonamiento van antes). Compartido por plan y chat."""
+    objetos = [o for o in _extraer_jsons(texto) if isinstance(o, dict)]
+    con_clave = [o for o in objetos if criterio(o)]
+    return con_clave[-1] if con_clave else None
+
+
 def _elegir_respuesta(texto: str):
     """El ÚLTIMO objeto con clave "plan" de tipo lista (los borradores van antes)."""
-    objetos = [o for o in _extraer_jsons(texto) if isinstance(o, dict)]
-    con_clave = [o for o in objetos if isinstance(o.get("plan"), list)]
-    return con_clave[-1] if con_clave else None
+    return _elegir_objeto(texto, lambda o: isinstance(o.get("plan"), list))
 
 
 def llamar_ollama(prompt: str, modelo: str, timeout: float = TIMEOUT_OLLAMA) -> str:
