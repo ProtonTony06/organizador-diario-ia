@@ -22,6 +22,10 @@
   * { box-sizing: border-box; }
   body { margin: 0; padding: 20px 16px 48px; background: var(--fondo);
          color: var(--tinta); font: 16px/1.5 system-ui, sans-serif; }
+  /* En el chat la caja de entrada se pega abajo (los 48px son para el pie
+     del plan): la clase la pone ponerPestaña() al entrar/salir del Chat.
+     El calc de .vista-chat va acorde a este 10px, sin scroll fantasma. */
+  body.en-chat { padding-bottom: 10px; }
   main { max-width: 640px; margin: 0 auto; }
   h1 { font-size: 1.3rem; margin: 0 0 4px; }
   .meta { color: var(--suave); font-size: .9rem; margin-bottom: 16px; }
@@ -63,9 +67,12 @@
                             background: color-mix(in srgb, var(--acento) 16%, transparent); }
 
   /* Vista chat: columna a pantalla (cabeza fuera), mensajes con scroll propio
-     y la caja de entrada fija abajo. color-mix sin soporte cae en --tarjeta. */
+     y la caja de entrada fija abajo. color-mix sin soporte cae en --tarjeta.
+     La resta (96px) es: padding-top del body (20) + pestañas (~64) + los
+     10px de body.en-chat, con margen pequeño de holgura → la caja queda a
+     ~10-19px del borde inferior sin scroll de página. */
   .vista-chat { display: flex; flex-direction: column;
-                height: calc(100vh - 190px); height: calc(100dvh - 190px);
+                height: calc(100vh - 96px); height: calc(100dvh - 96px);
                 min-height: 320px; }
   .vista-chat[hidden] { display: none; }
   .chat-hilo { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 10px;
@@ -377,6 +384,8 @@ async function enviarChat() {
 
 function ponerPestaña(nombre, guardar) {
   const esChat = nombre === "chat";
+  // En el chat el body se estrecha por abajo (body.en-chat, ver CSS).
+  document.body.classList.toggle("en-chat", esChat);
   document.getElementById("pestañaPlan").classList.toggle("activa", !esChat);
   document.getElementById("pestañaChat").classList.toggle("activa", esChat);
   document.getElementById("pestañaPlan").setAttribute("aria-pressed", String(!esChat));
