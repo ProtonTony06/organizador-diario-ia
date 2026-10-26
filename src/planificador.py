@@ -16,6 +16,7 @@ import logging
 import re
 import subprocess
 import sys
+import time
 from datetime import date
 from pathlib import Path
 
@@ -36,6 +37,20 @@ log = logging.getLogger("planificador")
 # stdin DEVNULL (colgaba sin él) y --nowordwrap (el CLI corrompía
 # cadenas largas re-envolviendo las líneas).
 TIMEOUT_OLLAMA = 480.0
+
+# El cloud de Ollama tira fallos TRANSITORIOS de red (p. ej. 502 Bad
+# Gateway, hallado en producción en run real 2026-10-26: la mañana entera
+# acabó en plan mecánico por DOS 502 seguidos — nadie reintentaba la
+# LLAMADA, solo el JSON inválido). Reintentos con backoff corto y SOLO
+# para esto: un timeout completo NO se reintenta (generación lenta, no
+# red rota: repetir duplica coste). La excepción se lanza agotados ellos.
+REINTENTOS_RED = 3
+SEGS_BASE_RED = 20.0
+MARCA_TRANSITORIA = (
+    "502 ", "503 ", "504 ", "bad gateway", "service unavailable",
+    "gateway timeout", "connection refused", "connection reset",
+    "server error", "temporary failure", "eof",
+)
 
 
 def _limpiar(salida: str) -> str:
@@ -133,16 +148,39 @@ def _elegir_respuesta(texto: str):
 
 
 def llamar_ollama(prompt: str, modelo: str, timeout: float = TIMEOUT_OLLAMA) -> str:
-    """Llama al CLI de ollama y devuelve stdout limpio (ver notas de resumen)."""
-    resultado = subprocess.run(
-        ["ollama", "run", modelo, "--think=false", "--format", "json", "--nowordwrap", prompt],
-        capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
-    )
-    if resultado.returncode != 0:
-        raise RuntimeError(
-            f"ollama devolvió código {resultado.returncode}: {resultado.stderr[-300:]}"
+    """Llama al CLI de ollama y devuelve stdout limpio (ver notas de resumen).
+
+    Reintenta SOLO los fallos de red transitorios del cloud (502 y similares)
+    con backoff corto; lo demás (timeout del propio llamar_ollama incluido)
+    sigue siendo error inmediato: la validación/reintentos de nivel superior
+    ya tienen su política y un timeout no es un tropezón de red.
+    """
+    for intento in range(1, REINTENTOS_RED + 1):
+        try:
+            resultado = subprocess.run(
+                ["ollama", "run", modelo, "--think=false", "--format", "json", "--nowordwrap", prompt],
+                capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
+            )
+        except subprocess.TimeoutExpired:
+            raise
+        if resultado.returncode == 0:
+            return _limpiar(resultado.stdout)
+        # El CLI mezcla el error con su spinner en stdout Y stderr; la
+        # huella del 502 puede estar en cualquiera de los dos.
+        ruido = (resultado.stderr + " " + resultado.stdout).lower()
+        transitorio = any(marca in ruido for marca in MARCA_TRANSITORIA)
+        if not transitorio or intento == REINTENTOS_RED:
+            raise RuntimeError(
+                f"ollama devolvió código {resultado.returncode}: "
+                f"{resultado.stderr[-300:] or resultado.stdout[-300:]}"
+            )
+        log.warning(
+            "Fallo transitorio de ollama (intento %d/%d), reintento en %ds: %s",
+            intento, REINTENTOS_RED, int(SEGS_BASE_RED * intento),
+            (resultado.stderr.strip() or resultado.stdout.strip())[-120:],
         )
-    return _limpiar(resultado.stdout)
+        time.sleep(SEGS_BASE_RED * intento)
+    raise RuntimeError("llamar_ollama agotó los reintentos de red")  # inalcanzable
 
 
 def leer_config() -> dict:

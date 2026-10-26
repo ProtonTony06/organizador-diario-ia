@@ -5,6 +5,7 @@ gastar modelo en tests). La validación usa rutinas de ejemplo propias y el
 plan mecánico se verifica contra config/rutinas.yaml real.
 """
 
+import subprocess  # noqa: F401 — los tests falsifican subprocess.run
 import sys
 import unittest
 import yaml
@@ -270,6 +271,77 @@ class TestPlanMecanico(unittest.TestCase):
         self.assertEqual(resultado["plan"], [])
         self.assertEqual(resultado["fallback"], True)
         self.assertEqual(resultado["valido"], True)
+
+
+def _proceso(codigo: int, stdout: str = "", stderr: str = ""):
+    """Sustituto de subprocess.run.CompletedProcess para los tests de red."""
+    return subprocess.CompletedProcess(["ollama"], codigo, stdout=stdout, stderr=stderr)
+
+
+class TestReintentosRed(unittest.TestCase):
+    """Los 502 del cloud NO pueden tumbar la mañana (run real 2026-10-26:
+    plan mecánico por dos 502 seguidos). Se falsifica subprocess.run."""
+
+    def setUp(self):
+        self.sueño = []
+        self._sleep = planificador.time.sleep
+        planificador.time.sleep = self.sueño.append
+
+    def tearDown(self):
+        planificador.time.sleep = self._sleep
+
+    def falsificar(self, resultados):
+        llamadas = []
+        def run(*args, **kwargs):
+            llamadas.append(1)
+            return resultados[min(len(llamadas) - 1, len(resultados) - 1)]
+        self._run = planificador.subprocess.run
+        planificador.subprocess.run = run
+        self.addCleanup(setattr, planificador.subprocess, "run", self._run)
+        return llamadas
+
+    def test_502_reintenta_y_sale(self):
+        llamadas = self.falsificar([
+            _proceso(1, stderr="Error: 502 Bad Gateway: Post \"http..."),
+            _proceso(0, stdout='{"respuesta": "vale"}'),
+        ])
+        self.assertEqual(planificador.llamar_ollama("p", "m"), '{"respuesta": "vale"}')
+        self.assertEqual(len(llamadas), 2)
+        self.assertEqual(self.sueño, [20.0])  # backoff del primer reintento
+
+    def test_dos_502_y_venta_en_el_tercero(self):
+        llamadas = self.falsificar([
+            _proceso(1, stderr="Error: 502 Bad Gateway"),
+            _proceso(1, stdout="... [K Error: 503 Service Unavailable"),
+            _proceso(0, stdout="ok"),
+        ])
+        self.assertEqual(planificador.llamar_ollama("p", "m"), "ok")
+        self.assertEqual(self.sueño, [20.0, 40.0])  # backoff creciente
+
+    def test_tres_502_agotan_y_lanzan(self):
+        self.falsificar([_proceso(1, stderr="Error: 502 Bad Gateway")])
+        with self.assertRaises(RuntimeError) as capturado:
+            planificador.llamar_ollama("p", "m")
+        self.assertIn("502", str(capturado.exception))
+
+    def test_error_no_transitorio_no_reintenta(self):
+        llamadas = self.falsificar([_proceso(1, stderr="Error: ollama server not running")])
+        with self.assertRaises(RuntimeError):
+            planificador.llamar_ollama("p", "m")
+        self.assertEqual(len(llamadas), 1)
+        self.assertEqual(self.sueño, [])
+
+    def test_timeout_no_reintenta(self):
+        llamadas = []
+        def run(*args, **kwargs):
+            llamadas.append(1)
+            raise subprocess.TimeoutExpired(cmd="ollama", timeout=480)
+        self._run = planificador.subprocess.run
+        planificador.subprocess.run = run
+        self.addCleanup(setattr, planificador.subprocess, "run", self._run)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            planificador.llamar_ollama("p", "m")
+        self.assertEqual(len(llamadas), 1)
 
 
 if __name__ == "__main__":
